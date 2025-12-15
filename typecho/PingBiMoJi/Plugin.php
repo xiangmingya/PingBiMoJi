@@ -6,7 +6,6 @@ use Typecho\Plugin\PluginInterface;
 use Typecho\Widget\Helper\Form;
 use Typecho\Widget\Helper\Form\Element\Text;
 use Typecho\Widget\Helper\Form\Element\Radio;
-use Widget\Contents\Post\Edit as PostEdit;
 use Widget\Options;
 use Utils\Helper;
 
@@ -19,7 +18,7 @@ if (!defined('__TYPECHO_ROOT_DIR__')) {
  *
  * @package PingBiMoJi
  * @author xiangmingya
- * @version 1.1.0
+ * @version 1.1.1
  * @link https://blogscn.fun
  */
 class Plugin implements PluginInterface
@@ -29,8 +28,8 @@ class Plugin implements PluginInterface
      */
     public static function activate()
     {
-        // 挂载到文章发布完成后的钩子
-        \Typecho\Plugin::factory('Widget_Contents_Post_Edit')->finishPublish = __CLASS__ . '::pushToBiMoJi';
+        // 挂载到文章发布完成后的钩子（兼容 Typecho 1.x 和 2.x）
+        \Typecho\Plugin::factory('Widget\Contents\Post\Edit')->finishPublish = __CLASS__ . '::pushToBiMoJi';
 
         // 添加后台日志面板
         Helper::addPanel(3, 'PingBiMoJi/Logs.php', '笔墨迹推送日志', '查看笔墨迹推送日志', 'administrator');
@@ -85,7 +84,7 @@ class Plugin implements PluginInterface
         // 推送时机
         $pushTiming = new Radio('pushTiming',
             ['publish' => _t('仅新发布时'), 'all' => _t('发布和更新时')],
-            'publish',
+            'all',
             _t('推送时机'),
             _t('选择何时触发推送通知'));
         $form->addInput($pushTiming);
@@ -112,66 +111,70 @@ class Plugin implements PluginInterface
      * 文章发布后推送到笔墨迹
      *
      * @param array $contents 文章内容
-     * @param PostEdit $class 文章编辑对象
+     * @param object $class 文章编辑对象
      */
     public static function pushToBiMoJi($contents, $class)
     {
-        // 获取插件配置
-        $options = Options::alloc();
-        $pluginConfig = $options->plugin('PingBiMoJi');
+        // 先记录一条日志，确认钩子被触发
+        self::saveLog('钩子触发', $class->permalink ?? 'unknown', '调试', '钩子已触发，开始处理');
 
-        // 检查是否启用
-        if ($pluginConfig->enabled != '1') {
-            return;
+        try {
+            // 获取插件配置
+            $options = Options::alloc();
+            $pluginConfig = $options->plugin('PingBiMoJi');
+
+            // 检查是否启用
+            if ($pluginConfig->enabled != '1') {
+                self::saveLog('跳过', $class->permalink ?? '', '跳过', '插件未启用');
+                return;
+            }
+
+            // 检查是否为文章（排除页面）
+            // finishPublish 钩子只在发布完成后触发，所以这里直接检查 $class 的状态
+            $postType = $contents['type'] ?? $class->type ?? 'post';
+            if ($postType !== 'post') {
+                self::saveLog('跳过', $class->permalink ?? '', '跳过', '非文章类型: ' . $postType);
+                return;
+            }
+
+            // finishPublish 钩子只在发布成功后触发，不需要再检查状态
+            // 直接进行推送
+
+            // 获取配置
+            $apiUrl = $pluginConfig->apiUrl;
+            $rssUrl = $pluginConfig->rssUrl;
+            $token = $pluginConfig->token;
+            $debug = $pluginConfig->debug == '1';
+
+            if (empty($apiUrl) || empty($rssUrl)) {
+                self::saveLog('配置错误', $class->permalink ?? '', '失败', 'API地址或RSS地址未配置');
+                return;
+            }
+
+            // 构建请求参数
+            $params = [
+                'rss' => $rssUrl,
+                'title' => $contents['title'] ?? '',
+            ];
+
+            if (!empty($token)) {
+                $params['token'] = $token;
+            }
+
+            // 发送 Ping 请求
+            $result = self::sendPing($apiUrl, $params, $debug);
+
+            // 记录日志到文件
+            self::saveLog(
+                $contents['title'] ?? '无标题',
+                $class->permalink ?? '',
+                $result['success'] ? '成功' : '失败',
+                $result['message']
+            );
+
+        } catch (\Exception $e) {
+            self::saveLog('异常', $class->permalink ?? '', '失败', '异常: ' . $e->getMessage());
         }
-
-        // 检查是否为文章（排除页面）
-        if ($contents['type'] !== 'post') {
-            return;
-        }
-
-        // 检查文章状态（只推送已发布的）
-        if ($contents['status'] !== 'publish') {
-            return;
-        }
-
-        // 检查推送时机
-        $isNew = empty($contents['cid']) || $class->request->get('do') === 'publish';
-        if ($pluginConfig->pushTiming === 'publish' && !$isNew) {
-            return;
-        }
-
-        // 获取配置
-        $apiUrl = $pluginConfig->apiUrl;
-        $rssUrl = $pluginConfig->rssUrl;
-        $token = $pluginConfig->token;
-        $debug = $pluginConfig->debug == '1';
-
-        if (empty($apiUrl) || empty($rssUrl)) {
-            self::saveLog('配置错误', $class->permalink, '失败', 'API地址或RSS地址未配置');
-            return;
-        }
-
-        // 构建请求参数
-        $params = [
-            'rss' => $rssUrl,
-            'title' => $contents['title'] ?? '',
-        ];
-
-        if (!empty($token)) {
-            $params['token'] = $token;
-        }
-
-        // 发送 Ping 请求
-        $result = self::sendPing($apiUrl, $params, $debug);
-
-        // 记录日志到文件
-        self::saveLog(
-            $contents['title'] ?? '无标题',
-            $class->permalink,
-            $result['success'] ? '成功' : '失败',
-            $result['message']
-        );
     }
 
     /**
@@ -262,9 +265,9 @@ class Plugin implements PluginInterface
         $logFile = __DIR__ . '/push_log.txt';
         $time = date('Y-m-d H:i:s');
 
-        // 格式：[时间] 链接 状态 标题 消息
+        // 格式：[时间] 链接 状态 「标题」 消息
         $log = sprintf("[%s] %s %s 「%s」 %s", $time, $url, $status, $title, $message);
 
-        file_put_contents($logFile, $log . PHP_EOL, FILE_APPEND);
+        @file_put_contents($logFile, $log . PHP_EOL, FILE_APPEND);
     }
 }
