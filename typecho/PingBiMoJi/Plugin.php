@@ -6,6 +6,7 @@ use Typecho\Plugin\PluginInterface;
 use Typecho\Widget\Helper\Form;
 use Typecho\Widget\Helper\Form\Element\Text;
 use Typecho\Widget\Helper\Form\Element\Radio;
+use Typecho\Widget\Helper\Form\Element\Hidden;
 use Widget\Options;
 use Utils\Helper;
 
@@ -18,62 +19,41 @@ if (!defined('__TYPECHO_ROOT_DIR__')) {
  *
  * @package PingBiMoJi
  * @author xiangmingya
- * @version 1.1.1
+ * @version 1.2.0
  * @link https://blogscn.fun
  */
 class Plugin implements PluginInterface
 {
-    /**
-     * 激活插件
-     */
     public static function activate()
     {
-        // 挂载到文章发布完成后的钩子（兼容 Typecho 1.x 和 2.x）
         \Typecho\Plugin::factory('Widget\Contents\Post\Edit')->finishPublish = __CLASS__ . '::pushToBiMoJi';
-
-        // 添加后台日志面板
         Helper::addPanel(3, 'PingBiMoJi/Logs.php', '笔墨迹推送日志', '查看笔墨迹推送日志', 'administrator');
-
         return _t('插件已激活，发布文章时将自动通知笔墨迹抓取');
     }
 
-    /**
-     * 禁用插件
-     */
     public static function deactivate()
     {
-        // 移除后台面板
         Helper::removePanel(3, 'PingBiMoJi/Logs.php');
-
         return _t('插件已禁用');
     }
 
-    /**
-     * 插件配置面板
-     *
-     * @param Form $form
-     */
     public static function config(Form $form)
     {
-        // 笔墨迹地址
         $apiUrl = new Text('apiUrl', null, 'https://blogscn.fun/blogs/api/ping',
             _t('笔墨迹 Ping 接口地址'),
             _t('默认为 https://blogscn.fun/blogs/api/ping，如果是私有部署请修改'));
         $form->addInput($apiUrl->addRule('url', _t('请输入正确的URL地址')));
 
-        // RSS 地址
         $rssUrl = new Text('rssUrl', null, '',
             _t('你的 RSS 地址'),
             _t('你在笔墨迹登记的 RSS 地址，如：https://yourblog.com/feed/'));
         $form->addInput($rssUrl->addRule('required', _t('RSS 地址不能为空')));
 
-        // 验证 Token（可选）
         $token = new Text('token', null, '',
             _t('验证 Token（可选）'),
             _t('如果笔墨迹为你分配了专属 Token，请填写'));
         $form->addInput($token);
 
-        // 是否启用
         $enabled = new Radio('enabled',
             ['1' => _t('启用'), '0' => _t('禁用')],
             '1',
@@ -81,7 +61,6 @@ class Plugin implements PluginInterface
             _t('禁用后发布文章将不会通知笔墨迹'));
         $form->addInput($enabled);
 
-        // 推送时机
         $pushTiming = new Radio('pushTiming',
             ['publish' => _t('仅新发布时'), 'all' => _t('发布和更新时')],
             'all',
@@ -89,58 +68,174 @@ class Plugin implements PluginInterface
             _t('选择何时触发推送通知'));
         $form->addInput($pushTiming);
 
-        // 调试模式
+        // 博主地图功能
+        $locationEnabled = new Radio('locationEnabled',
+            ['1' => _t('参与'), '0' => _t('不参与')],
+            '0',
+            _t('参与博主地图'),
+            _t('开启后将获取您的大致位置用于博主地图展示，位置信息仅精确到城市级别'));
+        $form->addInput($locationEnabled);
+
+        $latitude = new Hidden('latitude', null, '');
+        $form->addInput($latitude);
+
+        $longitude = new Hidden('longitude', null, '');
+        $form->addInput($longitude);
+
         $debug = new Radio('debug',
             ['1' => _t('开启'), '0' => _t('关闭')],
             '0',
             _t('调试模式'),
             _t('开启后会在日志中记录更多详情'));
         $form->addInput($debug);
+
+        // 注入位置获取JS
+        echo self::getLocationScript();
     }
 
-    /**
-     * 个人用户配置
-     *
-     * @param Form $form
-     */
     public static function personalConfig(Form $form)
     {
     }
 
-    /**
-     * 文章发布后推送到笔墨迹
-     *
-     * @param array $contents 文章内容
-     * @param object $class 文章编辑对象
-     */
+    private static function getLocationScript()
+    {
+        return <<<'HTML'
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    var locationOn = document.querySelector('input[name="locationEnabled"][value="1"]');
+    var locationOff = document.querySelector('input[name="locationEnabled"][value="0"]');
+    var latInput = document.querySelector('input[name="latitude"]');
+    var lngInput = document.querySelector('input[name="longitude"]');
+    var rssInput = document.querySelector('input[name="rssUrl"]');
+    var apiInput = document.querySelector('input[name="apiUrl"]');
+
+    if (!locationOn || !latInput || !lngInput) return;
+
+    var statusDiv = document.createElement('div');
+    statusDiv.style.cssText = 'margin:10px 0;padding:10px;background:#f5f5f5;border-radius:4px;display:none;';
+    locationOn.closest('li').appendChild(statusDiv);
+
+    function setOff() {
+        locationOff.checked = true;
+        locationOn.checked = false;
+    }
+
+    function sendLocation(lat, lng) {
+        var rss = rssInput ? rssInput.value : '';
+        var api = apiInput ? apiInput.value : '';
+        var url = api.replace('/ping', '/updateLocation') + '?rss=' + encodeURIComponent(rss) + '&lat=' + lat + '&lng=' + lng;
+        fetch(url).then(function(r) { return r.json(); }).then(function(data) {
+            if (data.code === 200) {
+                statusDiv.innerHTML = '<span style="color:#05d305;">✓ 位置已同步到服务器</span> <button type="button" id="getLocationBtn" style="margin-left:10px;padding:2px 8px;cursor:pointer;">重新获取</button>';
+            } else {
+                statusDiv.innerHTML = '<span style="color:#e74c3c;">同步失败: ' + data.msg + '</span> <button type="button" id="getLocationBtn" style="margin-left:10px;padding:2px 8px;cursor:pointer;">重试</button>';
+            }
+            bindBtn();
+        }).catch(function() {
+            statusDiv.innerHTML = '<span style="color:#e74c3c;">网络错误</span> <button type="button" id="getLocationBtn" style="margin-left:10px;padding:2px 8px;cursor:pointer;">重试</button>';
+            bindBtn();
+        });
+    }
+
+    function getLocation() {
+        if (!navigator.geolocation) { alert('您的浏览器不支持位置获取'); return; }
+        if (confirm('笔墨迹希望获取您的位置信息\n\n用途：在博主地图上展示您的大致位置（城市级别）\n\n• 位置信息仅用于博主地图功能\n• 我们只保存粗略位置，不会精确到街道\n• 您可以随时关闭此功能\n\n是否允许获取位置？')) {
+            statusDiv.innerHTML = '<span style="color:#3498db;">正在获取位置...</span>';
+            navigator.geolocation.getCurrentPosition(
+                function(pos) {
+                    var lat = pos.coords.latitude.toFixed(2);
+                    var lng = pos.coords.longitude.toFixed(2);
+                    latInput.value = lat;
+                    lngInput.value = lng;
+                    statusDiv.innerHTML = '<span style="color:#05d305;">✓ 位置已更新，正在同步...</span>';
+                    sendLocation(lat, lng);
+                },
+                function(err) {
+                    var msg = err.code === 1 ? '您拒绝了位置授权' : err.code === 2 ? '无法获取位置信息' : '获取位置超时';
+                    statusDiv.innerHTML = '<span style="color:#e74c3c;">' + msg + '</span> <button type="button" id="getLocationBtn" style="margin-left:10px;padding:2px 8px;cursor:pointer;">重试</button>';
+                    bindBtn();
+                },
+                {enableHighAccuracy: false, timeout: 10000}
+            );
+        } else {
+            setOff();
+            statusDiv.style.display = 'none';
+        }
+    }
+
+    function bindBtn() {
+        var btn = document.getElementById('getLocationBtn');
+        if (btn) btn.onclick = getLocation;
+    }
+
+    function updateStatus() {
+        if (latInput.value && lngInput.value) {
+            statusDiv.innerHTML = '<span style="color:#05d305;">✓ 已获取位置</span> <button type="button" id="getLocationBtn" style="margin-left:10px;padding:2px 8px;cursor:pointer;">重新获取</button>';
+        } else {
+            statusDiv.innerHTML = '<span style="color:#999;">未获取位置</span> <button type="button" id="getLocationBtn" style="margin-left:10px;padding:4px 12px;cursor:pointer;background:#3498db;color:#fff;border:none;border-radius:3px;">获取位置</button>';
+        }
+        bindBtn();
+    }
+
+    locationOn.addEventListener('click', function() {
+        var rss = rssInput ? rssInput.value.trim() : '';
+        if (!rss) {
+            alert('请先填写RSS地址');
+            setOff();
+            return;
+        }
+        statusDiv.style.display = 'block';
+        updateStatus();
+    });
+
+    locationOff.addEventListener('click', function() {
+        statusDiv.style.display = 'none';
+    });
+
+    if (locationOn.checked) {
+        statusDiv.style.display = 'block';
+        updateStatus();
+    }
+});
+</script>
+HTML;
+    }
+
     public static function pushToBiMoJi($contents, $class)
     {
-        // 先记录一条日志，确认钩子被触发
         self::saveLog('钩子触发', $class->permalink ?? 'unknown', '调试', '钩子已触发，开始处理');
 
         try {
-            // 获取插件配置
             $options = Options::alloc();
             $pluginConfig = $options->plugin('PingBiMoJi');
 
-            // 检查是否启用
             if ($pluginConfig->enabled != '1') {
                 self::saveLog('跳过', $class->permalink ?? '', '跳过', '插件未启用');
                 return;
             }
 
-            // 检查是否为文章（排除页面）
-            // finishPublish 钩子只在发布完成后触发，所以这里直接检查 $class 的状态
             $postType = $contents['type'] ?? $class->type ?? 'post';
             if ($postType !== 'post') {
                 self::saveLog('跳过', $class->permalink ?? '', '跳过', '非文章类型: ' . $postType);
                 return;
             }
 
-            // finishPublish 钩子只在发布成功后触发，不需要再检查状态
-            // 直接进行推送
+            // 判断推送时机
+            $pushTiming = $pluginConfig->pushTiming ?? 'all';
+            $cid = $contents['cid'] ?? $class->cid ?? null;
 
-            // 获取配置
+            if ($pushTiming === 'publish' && $cid) {
+                // 检查文章是否已存在（通过判断创建时间和修改时间是否相近）
+                $created = $contents['created'] ?? $class->created ?? 0;
+                $modified = $contents['modified'] ?? $class->modified ?? time();
+
+                // 如果修改时间比创建时间晚超过60秒，认为是更新操作
+                if ($modified - $created > 60) {
+                    self::saveLog('跳过', $class->permalink ?? '', '跳过', '文章更新，仅新发布时推送');
+                    return;
+                }
+            }
+
             $apiUrl = $pluginConfig->apiUrl;
             $rssUrl = $pluginConfig->rssUrl;
             $token = $pluginConfig->token;
@@ -151,7 +246,6 @@ class Plugin implements PluginInterface
                 return;
             }
 
-            // 构建请求参数
             $params = [
                 'rss' => $rssUrl,
                 'title' => $contents['title'] ?? '',
@@ -161,10 +255,18 @@ class Plugin implements PluginInterface
                 $params['token'] = $token;
             }
 
-            // 发送 Ping 请求
+            // 添加位置信息
+            if ($pluginConfig->locationEnabled == '1') {
+                $lat = $pluginConfig->latitude;
+                $lng = $pluginConfig->longitude;
+                if (!empty($lat) && !empty($lng)) {
+                    $params['lat'] = $lat;
+                    $params['lng'] = $lng;
+                }
+            }
+
             $result = self::sendPing($apiUrl, $params, $debug);
 
-            // 记录日志到文件
             self::saveLog(
                 $contents['title'] ?? '无标题',
                 $class->permalink ?? '',
@@ -177,14 +279,6 @@ class Plugin implements PluginInterface
         }
     }
 
-    /**
-     * 发送 Ping 请求
-     *
-     * @param string $url API地址
-     * @param array $params 参数
-     * @param bool $debug 是否调试
-     * @return array
-     */
     private static function sendPing($url, $params, $debug = false)
     {
         $queryString = http_build_query($params);
@@ -194,7 +288,6 @@ class Plugin implements PluginInterface
             error_log('[PingBiMoJi] 发送请求: ' . $fullUrl);
         }
 
-        // 使用 cURL
         if (function_exists('curl_init')) {
             $ch = curl_init();
             curl_setopt($ch, CURLOPT_URL, $fullUrl);
@@ -203,7 +296,7 @@ class Plugin implements PluginInterface
             curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
             curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
             curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-            curl_setopt($ch, CURLOPT_USERAGENT, 'PingBiMoJi/1.1');
+            curl_setopt($ch, CURLOPT_USERAGENT, 'PingBiMoJi/1.2');
 
             $response = curl_exec($ch);
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -218,7 +311,6 @@ class Plugin implements PluginInterface
                 return ['success' => false, 'message' => 'HTTP错误: ' . $httpCode];
             }
 
-            // 解析响应
             $data = json_decode($response, true);
             if ($data && isset($data['code'])) {
                 if ($data['code'] == 200) {
@@ -235,11 +327,10 @@ class Plugin implements PluginInterface
             return ['success' => true, 'message' => '已发送通知'];
 
         } else {
-            // 使用 file_get_contents
             $context = stream_context_create([
                 'http' => [
                     'timeout' => 10,
-                    'user_agent' => 'PingBiMoJi/1.1',
+                    'user_agent' => 'PingBiMoJi/1.2',
                 ]
             ]);
 
@@ -252,22 +343,11 @@ class Plugin implements PluginInterface
         }
     }
 
-    /**
-     * 保存日志到文件
-     *
-     * @param string $title 文章标题
-     * @param string $url 文章链接
-     * @param string $status 状态（成功/失败）
-     * @param string $message 消息
-     */
     private static function saveLog($title, $url, $status, $message)
     {
         $logFile = __DIR__ . '/push_log.txt';
         $time = date('Y-m-d H:i:s');
-
-        // 格式：[时间] 链接 状态 「标题」 消息
         $log = sprintf("[%s] %s %s 「%s」 %s", $time, $url, $status, $title, $message);
-
         @file_put_contents($logFile, $log . PHP_EOL, FILE_APPEND);
     }
 }
